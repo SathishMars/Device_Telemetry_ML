@@ -51,24 +51,83 @@ app.add_middleware(
 )
 
 # ─── Prometheus Metrics ───────────────────────────────────
+
+# --- Request Metrics ---
 PREDICTIONS_TOTAL = Counter(
     "predictions_total", "Total predictions", ["problem_statement", "risk_tier"]
 )
 PREDICTION_LATENCY = Histogram(
     "prediction_latency_seconds", "Prediction latency",
-    ["problem_statement"]
-)
-FAILURE_PROB_GAUGE = Gauge(
-    "failure_probability_last", "Last failure probability prediction"
-)
-ANOMALY_RATE_GAUGE = Gauge(
-    "anomaly_rate_current", "Current anomaly detection rate"
+    ["problem_statement"],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
 )
 HTTP_REQUESTS = Counter(
     "http_requests_total", "HTTP requests", ["method", "endpoint", "status"]
 )
 ERRORS_TOTAL = Counter("errors_total", "Total errors", ["error_type"])
+REQUESTS_IN_PROGRESS = Gauge(
+    "requests_in_progress", "Requests currently being processed", ["problem_statement"]
+)
+
+# --- Model Performance Metrics ---
+FAILURE_PROB_GAUGE = Gauge(
+    "failure_probability_last", "Last failure probability prediction"
+)
+FAILURE_PROB_HISTOGRAM = Histogram(
+    "failure_probability_distribution", "Distribution of failure probabilities",
+    buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+)
+ANOMALY_RATE_GAUGE = Gauge(
+    "anomaly_rate_current", "Current anomaly detection rate"
+)
+ANOMALY_SCORE_HISTOGRAM = Histogram(
+    "anomaly_score_distribution", "Distribution of anomaly scores",
+    buckets=[-0.5, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5]
+)
+SLA_RISK_HISTOGRAM = Histogram(
+    "sla_risk_score_distribution", "Distribution of SLA risk scores",
+    buckets=[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+)
+RUL_ESTIMATE_HISTOGRAM = Histogram(
+    "rul_estimate_days_distribution", "Distribution of RUL estimates",
+    buckets=[7, 14, 21, 30, 45, 60, 90]
+)
+
+# --- Risk Tier Counters ---
+RISK_TIER_TOTAL = Counter(
+    "risk_tier_total", "Total predictions by risk tier", ["tier"]
+)
+
+# --- System / Model Metrics ---
 MODEL_INFO = Gauge("model_loaded", "Model loaded status", ["problem_statement"])
+MODEL_LOAD_TIME = Gauge(
+    "model_load_time_seconds", "Time taken to load model", ["problem_statement"]
+)
+FEATURE_COUNT = Gauge(
+    "feature_count", "Number of features used by model", ["problem_statement"]
+)
+
+# --- Data / Drift Metrics ---
+DRIFT_SHARE_GAUGE = Gauge(
+    "drift_share_current", "Current data drift share (0-1)"
+)
+DATA_QUALITY_PASS_RATE = Gauge(
+    "data_quality_pass_rate", "Data quality check pass rate (0-100)"
+)
+RETRAINING_TRIGGERED = Counter(
+    "retraining_triggered_total", "Number of times retraining was triggered"
+)
+
+# --- Business Metrics ---
+DEVICES_AT_RISK = Gauge(
+    "devices_at_risk", "Number of devices in CRITICAL or HIGH risk tier"
+)
+MEAN_HEALTH_SCORE = Gauge(
+    "mean_health_score", "Average device health score across fleet"
+)
+SLA_BREACH_PROBABILITY_AVG = Gauge(
+    "sla_breach_probability_avg", "Average SLA breach probability"
+)
 
 # ─── Global State ─────────────────────────────────────────
 startup_time = time.time()
@@ -173,6 +232,20 @@ async def startup():
     print("=" * 50)
     print("  Loading models...")
     load_models()
+
+    # Load drift and quality metrics into Prometheus gauges
+    drift_path = os.path.join(BASE_DIR, "data", "drift_reports", "drift_decision.json")
+    if os.path.exists(drift_path):
+        with open(drift_path) as f:
+            drift = json.load(f)
+        DRIFT_SHARE_GAUGE.set(drift.get("drift_share", 0))
+
+    quality_path = os.path.join(BASE_DIR, "data", "quality_reports", "quality_summary.json")
+    if os.path.exists(quality_path):
+        with open(quality_path) as f:
+            quality = json.load(f)
+        DATA_QUALITY_PASS_RATE.set(quality.get("overall_pass_rate", 0))
+
     print("  API ready.")
     print("=" * 50)
 
@@ -302,6 +375,9 @@ async def predict_failure(telemetry: DeviceTelemetry):
         PREDICTIONS_TOTAL.labels(problem_statement="ps1", risk_tier=risk_tier).inc()
         PREDICTION_LATENCY.labels(problem_statement="ps1").observe(elapsed_ms / 1000)
         FAILURE_PROB_GAUGE.set(prob)
+        FAILURE_PROB_HISTOGRAM.observe(prob)
+        RISK_TIER_TOTAL.labels(tier=risk_tier).inc()
+        MEAN_HEALTH_SCORE.set(telemetry.health_score)
 
         return FailurePredictionResponse(
             device_id=telemetry.device_id,
@@ -360,6 +436,9 @@ async def predict_anomaly(telemetry: DeviceTelemetry):
             risk_tier="ANOMALY" if is_anomaly else "NORMAL"
         ).inc()
         PREDICTION_LATENCY.labels(problem_statement="ps4").observe(elapsed_ms / 1000)
+        ANOMALY_SCORE_HISTOGRAM.observe(score)
+        if is_anomaly:
+            ANOMALY_RATE_GAUGE.inc()
 
         return AnomalyResponse(
             device_id=telemetry.device_id,
@@ -419,6 +498,12 @@ async def predict_sla_risk(telemetry: DeviceTelemetry):
         prediction_count["ps5"] += 1
         PREDICTIONS_TOTAL.labels(problem_statement="ps5", risk_tier=risk_tier).inc()
         PREDICTION_LATENCY.labels(problem_statement="ps5").observe(elapsed_ms / 1000)
+        SLA_RISK_HISTOGRAM.observe(sla_risk)
+        RUL_ESTIMATE_HISTOGRAM.observe(rul)
+        RISK_TIER_TOTAL.labels(tier=risk_tier).inc()
+        SLA_BREACH_PROBABILITY_AVG.set(1 / (1 + np.exp(0.1 * (rul - 15))))
+        if risk_tier in ("CRITICAL", "HIGH"):
+            DEVICES_AT_RISK.inc()
 
         return SLARiskResponse(
             device_id=telemetry.device_id,
