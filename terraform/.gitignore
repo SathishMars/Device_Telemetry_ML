@@ -1,0 +1,17 @@
+# terraform/.gitignore
+
+# State files (contain secrets!)
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Variable files with secrets
+terraform.tfvars
+*.auto.tfvars
+
+# Lock file (can be committed, but optional)
+# .terraform.lock.hcl
+
+# Crash logs
+crash.log
+crash.*.log
