@@ -1,0 +1,236 @@
+name: Model Retraining Pipeline
+
+# ─── Triggers ─────────────────────────────────────────────
+on:
+  # Scheduled: runs daily at 6 AM UTC
+  schedule:
+    - cron: '0 6 * * *'
+
+  # Manual trigger (with options)
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for retraining'
+        required: true
+        default: 'manual'
+        type: choice
+        options:
+          - manual
+          - drift_detected
+          - performance_degradation
+          - new_data_available
+          - model_bug_fix
+      force_retrain:
+        description: 'Force retrain even if no drift detected'
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.11'
+  ACR_NAME: acrdevicetelemetry
+  RESOURCE_GROUP: rg-device-telemetry-dev
+  API_APP_NAME: telemetry-api
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 1: Check if retraining is needed
+  # ═══════════════════════════════════════════════════════
+  check-drift:
+    name: Check Data Drift
+    runs-on: ubuntu-latest
+    outputs:
+      should_retrain: ${{ steps.drift.outputs.should_retrain }}
+      drift_share: ${{ steps.drift.outputs.drift_share }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate data and run pipeline up to feature store
+        run: |
+          python data/generate_sample_data.py
+          python notebooks/01_bronze_layer.py
+          python notebooks/02_silver_layer.py
+          python notebooks/03_gold_layer.py
+          python notebooks/04_feature_store.py
+
+      - name: Run drift detection
+        run: python notebooks/10_drift_detection.py
+
+      - name: Evaluate drift decision
+        id: drift
+        run: |
+          python -c "
+          import json
+          with open('data/drift_reports/drift_decision.json') as f:
+              decision = json.load(f)
+          should_retrain = decision.get('should_retrain', False)
+          drift_share = decision.get('drift_share', 0)
+          # Force retrain if manually triggered
+          force = '${{ github.event.inputs.force_retrain }}' == 'true'
+          if force:
+              should_retrain = True
+          print(f'Drift share: {drift_share*100:.1f}%')
+          print(f'Should retrain: {should_retrain}')
+          # Set outputs
+          with open('$GITHUB_OUTPUT', 'a') as f:
+              f.write(f'should_retrain={str(should_retrain).lower()}\n')
+              f.write(f'drift_share={drift_share}\n')
+          " || echo "should_retrain=false" >> $GITHUB_OUTPUT
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 2: Retrain all models
+  # ═══════════════════════════════════════════════════════
+  retrain:
+    name: Retrain Models
+    runs-on: ubuntu-latest
+    needs: check-drift
+    if: needs.check-drift.outputs.should_retrain == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full pipeline (data + training + registration)
+        run: python run_pipeline.py
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            data/artifacts/
+            mlruns/
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 3: Validate retrained models
+  # ═══════════════════════════════════════════════════════
+  validate:
+    name: Validate Models
+    runs-on: ubuntu-latest
+    needs: retrain
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+
+      - name: Validate PS-1 champion metrics
+        run: |
+          python -c "
+          import json
+          with open('data/artifacts/ps1/champion_metrics.json') as f:
+              metrics = json.load(f)
+          auc = metrics.get('auc', 0)
+          f1 = metrics.get('f1', 0)
+          print(f'Champion: {metrics.get(\"model\", \"unknown\")}')
+          print(f'AUC: {auc:.4f}')
+          print(f'F1: {f1:.4f}')
+          assert auc > 0.80, f'AUC {auc} below threshold 0.80'
+          assert f1 > 0.30, f'F1 {f1} below threshold 0.30'
+          print('Model validation PASSED')
+          "
+
+      - name: Run API tests with new model
+        run: |
+          python run_pipeline.py
+          pytest tests/test_api.py -v
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 4: Deploy retrained model
+  # ═══════════════════════════════════════════════════════
+  deploy-retrained:
+    name: Deploy Retrained Model
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install and run pipeline
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python run_pipeline.py
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build and push new image
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+          IMAGE_TAG="retrain-$(date +%Y%m%d-%H%M%S)"
+          docker build -f api/Dockerfile \
+            -t ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${IMAGE_TAG} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${IMAGE_TAG}
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Deploy with Canary (10% traffic)
+        run: |
+          # Create new revision with 10% traffic
+          az containerapp update \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${{ env.IMAGE_TAG }} \
+            --revision-suffix "retrain"
+
+          az containerapp ingress traffic set \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --revision-weight \
+              "${{ env.API_APP_NAME }}--retrain=10" \
+              "latest=90"
+
+          echo "Canary deployed with 10% traffic"
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 5: Skip notification (if no retrain needed)
+  # ═══════════════════════════════════════════════════════
+  skip-notification:
+    name: No Retraining Needed
+    runs-on: ubuntu-latest
+    needs: check-drift
+    if: needs.check-drift.outputs.should_retrain != 'true'
+    steps:
+      - name: Log skip reason
+        run: |
+          echo "No retraining needed."
+          echo "Drift share: ${{ needs.check-drift.outputs.drift_share }}"
+          echo "Threshold: 0.30 (30%)"

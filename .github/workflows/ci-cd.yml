@@ -1,0 +1,283 @@
+name: Device Telemetry ML - CI/CD Pipeline
+
+# ─── When to trigger ─────────────────────────────────────
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  pull_request:
+    branches: [main]
+
+env:
+  ACR_NAME: acrdevicetelemetry
+  RESOURCE_GROUP: rg-device-telemetry-dev
+  API_APP_NAME: telemetry-api
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '18'
+
+# ─── Jobs ─────────────────────────────────────────────────
+jobs:
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 1: Lint & Validate Code
+  # ═══════════════════════════════════════════════════════
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install flake8 black isort
+
+      - name: Check code formatting (Black)
+        run: black --check --diff notebooks/ scripts/ api/ data/
+
+      - name: Check import ordering (isort)
+        run: isort --check-only --diff notebooks/ scripts/ api/
+
+      - name: Lint with flake8
+        run: flake8 notebooks/ scripts/ api/ --max-line-length 120 --ignore E501,W503,E402
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 2: Run Data Pipeline Tests
+  # ═══════════════════════════════════════════════════════
+  test-pipeline:
+    name: Test Data Pipeline
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate sample data
+        run: python data/generate_sample_data.py
+
+      - name: Run Bronze layer
+        run: python notebooks/01_bronze_layer.py
+
+      - name: Run Silver layer
+        run: python notebooks/02_silver_layer.py
+
+      - name: Run Gold layer
+        run: python notebooks/03_gold_layer.py
+
+      - name: Run Feature Store
+        run: python notebooks/04_feature_store.py
+
+      - name: Run Data Quality checks
+        run: python scripts/run_data_quality.py
+
+      - name: Verify outputs exist
+        run: |
+          test -f data/gold/device_features.parquet
+          test -f data/feature_store/device_telemetry_features.parquet
+          test -f data/quality_reports/quality_summary.json
+          echo "All pipeline outputs verified"
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 3: Train Models & Validate
+  # ═══════════════════════════════════════════════════════
+  test-models:
+    name: Train & Validate Models
+    runs-on: ubuntu-latest
+    needs: test-pipeline
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full pipeline (data + training)
+        run: python run_pipeline.py --skip-data
+        # skip-data assumes test-pipeline already generated it
+        # In CI we re-generate to be safe:
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+
+      - name: Regenerate data and run full pipeline
+        run: python run_pipeline.py
+
+      - name: Verify model artifacts
+        run: |
+          test -f data/artifacts/ps1/champion_model.pkl
+          test -f data/artifacts/ps4/isolation_forest_model.pkl
+          test -f data/artifacts/ps5/rul_estimates.csv
+          echo "All model artifacts verified"
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 4: Test API
+  # ═══════════════════════════════════════════════════════
+  test-api:
+    name: Test API
+    runs-on: ubuntu-latest
+    needs: test-models
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full pipeline first
+        run: python run_pipeline.py
+
+      - name: Run API tests
+        run: pytest tests/test_api.py -v
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 5: Test React Dashboard
+  # ═══════════════════════════════════════════════════════
+  test-dashboard:
+    name: Test Dashboard Build
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install and build dashboard
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
+
+      - name: Verify build output
+        run: test -d dashboard/dist
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 6: Build & Push Docker Image
+  # Runs only on push to main (not on PRs)
+  # ═══════════════════════════════════════════════════════
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test-api, test-dashboard]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for pipeline)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install and run pipeline
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python run_pipeline.py
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -f api/Dockerfile \
+            -t ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${IMAGE_TAG} \
+            -t ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:latest .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${IMAGE_TAG}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:latest
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 7: Deploy to Azure Container Apps
+  # ═══════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy new revision
+        run: |
+          az containerapp update \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.ACR_NAME }}.azurecr.io/telemetry-api:${{ github.sha }}
+
+      - name: Verify deployment
+        run: |
+          API_URL=$(az containerapp show \
+            --name ${{ env.API_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "API deployed at: https://${API_URL}"
+          # Health check
+          curl -sf "https://${API_URL}/health" || exit 1
+          echo "Health check passed"
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 8: Deploy React Dashboard
+  # ═══════════════════════════════════════════════════════
+  deploy-dashboard:
+    name: Deploy Dashboard
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build dashboard
+        run: |
+          cd dashboard
+          npm ci
+          npm run build
+
+      - name: Deploy to Azure Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_TOKEN }}
+          app_location: "/dashboard"
+          output_location: "dist"
