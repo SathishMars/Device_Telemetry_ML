@@ -4,7 +4,13 @@ API TESTS
 ============================================================
 """
 
+import os
+import sys
 import pytest
+
+# Ensure project root is in path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from fastapi.testclient import TestClient
 
 
