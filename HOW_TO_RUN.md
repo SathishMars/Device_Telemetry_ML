@@ -607,6 +607,66 @@ device_telemetry_mlops/
 
 ---
 
+## Daily Quick Start (Returning Next Day)
+
+If you've already run the full pipeline once, your data, models, and artifacts are all persisted on disk. You only need to **start the services**:
+
+### Open 4 Terminals
+
+**Terminal 1 — API Server:**
+```powershell
+cd D:\Sathish\ML_Device_Telemetry\device_telemetry_mlops
+venv\Scripts\Activate.ps1
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 — React Dashboard:**
+```powershell
+cd D:\Sathish\ML_Device_Telemetry\device_telemetry_mlops\dashboard
+npm run dev
+```
+
+**Terminal 3 — MLflow UI:**
+```powershell
+cd D:\Sathish\ML_Device_Telemetry\device_telemetry_mlops
+venv\Scripts\Activate.ps1
+mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db --port 5000
+```
+
+**Terminal 4 — Docker Monitoring (optional):**
+```powershell
+cd D:\Sathish\ML_Device_Telemetry\device_telemetry_mlops\monitoring
+docker compose up -d
+```
+
+### When to Re-run Specific Steps
+
+| Scenario | Command | What it does |
+|----------|---------|-------------|
+| Just viewing results | Start Terminals 1-3 above | Services only, no reprocessing |
+| New data arrived | `python scripts/run_incremental_daily.py` | Ingests + processes new day |
+| Check for drift | `python notebooks/10_drift_detection.py` | Runs Evidently AI on latest data |
+| Re-check data quality | `python scripts/run_data_quality.py` | Great Expectations validation |
+| Retrain all models (keep data) | `python run_pipeline.py --skip-data` | Re-runs steps 6-13 only |
+| Retrain only PS-1 | `python notebooks/05_ps1_failure_prediction.py` then `python scripts/register_models.py` | Faster, targeted retrain |
+| Full rebuild from scratch | `python run_pipeline.py` | All 13 steps |
+| Port 8000 stuck from yesterday | `netstat -ano \| findstr :8000` then `taskkill /F /PID <PID>` | Kill orphan process |
+
+### What's Persisted (survives restarts)
+
+| Data | Location | Recreated by |
+|------|----------|-------------|
+| Raw CSVs | `data/raw/` | `data/generate_sample_data.py` |
+| Bronze/Silver/Gold | `data/bronze/`, `silver/`, `gold/` | Notebooks 01-03 |
+| Feature Store | `data/feature_store/` | `notebooks/04_feature_store.py` |
+| Trained models (.pkl) | `data/artifacts/ps1-5/` | Notebooks 05-09 |
+| MLflow experiments | `mlruns/mlflow.db` | Training notebooks |
+| Drift reports (HTML) | `data/drift_reports/` | `notebooks/10_drift_detection.py` |
+| Quality reports | `data/quality_reports/` | `scripts/run_data_quality.py` |
+| Dashboard node_modules | `dashboard/node_modules/` | `npm install` |
+
+---
+
 ## Quick Reference
 
 | Action | Command |

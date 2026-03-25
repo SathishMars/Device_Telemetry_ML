@@ -542,6 +542,156 @@ async def predict_failure_batch(batch: BatchRequest):
     }
 
 
+@app.post("/predict/batch/all")
+async def predict_batch_all_ps(batch: BatchRequest):
+    """
+    Run ALL 5 Problem Statements on a batch of devices.
+    Returns combined results: PS-1 to PS-5 for every device.
+    """
+    start_time = time.time()
+
+    all_results = []
+
+    for device in batch.devices:
+        device_result = {"device_id": device.device_id}
+
+        # ── PS-1: Failure Prediction ──
+        if "ps1" in models:
+            try:
+                ps1_resp = await predict_failure(device)
+                device_result["ps1_failure"] = {
+                    "failure_probability": ps1_resp.failure_probability,
+                    "failure_prediction": ps1_resp.failure_prediction,
+                    "risk_tier": ps1_resp.risk_tier,
+                    "confidence": ps1_resp.confidence,
+                    "recommended_action": ps1_resp.recommended_action
+                }
+            except Exception as e:
+                device_result["ps1_failure"] = {"error": str(e)}
+
+        # ── PS-2: Error Pattern Recognition ──
+        # PS-2 is fleet-level analysis, so we compute per-device error risk indicators
+        device_result["ps2_error_patterns"] = {
+            "error_count": device.error_count,
+            "error_rate_per_day": round(device.cumulative_errors / max(device.age_days, 1), 4),
+            "error_severity": "HIGH" if device.error_count >= 5 else
+                              "MEDIUM" if device.error_count >= 2 else "LOW",
+            "reboot_frequency": round(device.cumulative_reboots / max(device.age_days, 1) * 30, 2),
+            "likely_escalation": device.error_count >= 3 and device.emergency_count >= 1
+        }
+
+        # ── PS-3: Root Cause Analysis ──
+        # Compute top contributing factors for this device's risk
+        risk_factors = []
+        if device.signal_strength_dbm < 60:
+            risk_factors.append({"factor": "Low signal strength", "value": device.signal_strength_dbm, "impact": "HIGH"})
+        if device.temperature_c > 50:
+            risk_factors.append({"factor": "High temperature", "value": device.temperature_c, "impact": "HIGH"})
+        if device.error_count >= 5:
+            risk_factors.append({"factor": "High error count", "value": device.error_count, "impact": "HIGH"})
+        if device.memory_usage_pct > 80:
+            risk_factors.append({"factor": "High memory usage", "value": device.memory_usage_pct, "impact": "MEDIUM"})
+        if device.cpu_usage_pct > 75:
+            risk_factors.append({"factor": "High CPU usage", "value": device.cpu_usage_pct, "impact": "MEDIUM"})
+        if device.tap_success_rate < 0.85:
+            risk_factors.append({"factor": "Low tap success rate", "value": device.tap_success_rate, "impact": "HIGH"})
+        if device.response_time_ms > 300:
+            risk_factors.append({"factor": "Slow response time", "value": device.response_time_ms, "impact": "MEDIUM"})
+        if device.age_days > 1000:
+            risk_factors.append({"factor": "Old device", "value": device.age_days, "impact": "MEDIUM"})
+        if device.uptime_hours < 20:
+            risk_factors.append({"factor": "Low uptime", "value": device.uptime_hours, "impact": "MEDIUM"})
+
+        device_result["ps3_root_cause"] = {
+            "risk_factors": sorted(risk_factors, key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x["impact"]]),
+            "total_risk_factors": len(risk_factors),
+            "primary_cause": risk_factors[0]["factor"] if risk_factors else "No significant risk factors"
+        }
+
+        # ── PS-4: Anomaly Detection ──
+        if "ps4" in models:
+            try:
+                ps4_resp = await predict_anomaly(device)
+                device_result["ps4_anomaly"] = {
+                    "is_anomaly": ps4_resp.is_anomaly,
+                    "anomaly_score": ps4_resp.anomaly_score,
+                    "anomaly_features": ps4_resp.anomaly_features
+                }
+            except Exception as e:
+                device_result["ps4_anomaly"] = {"error": str(e)}
+
+        # ── PS-5: SLA Risk ──
+        if "ps5_rul" in models:
+            try:
+                ps5_resp = await predict_sla_risk(device)
+                device_result["ps5_sla_risk"] = {
+                    "sla_risk_score": ps5_resp.sla_risk_score,
+                    "risk_tier": ps5_resp.risk_tier,
+                    "rul_estimate_days": ps5_resp.rul_estimate_days,
+                    "recommended_action": ps5_resp.recommended_action
+                }
+            except Exception as e:
+                device_result["ps5_sla_risk"] = {"error": str(e)}
+
+        all_results.append(device_result)
+
+    elapsed = (time.time() - start_time) * 1000
+
+    # Fleet-wide PS-2 summary (error co-occurrence across the batch)
+    error_devices = [d for d in batch.devices if d.error_count >= 3]
+    high_error_devices = [d for d in batch.devices if d.error_count >= 5]
+
+    # Fleet-wide summary
+    summary = {
+        "total_devices": len(batch.devices),
+        "processing_time_ms": round(elapsed, 1),
+        "ps1_summary": {
+            "critical": sum(1 for r in all_results if r.get("ps1_failure", {}).get("risk_tier") == "CRITICAL"),
+            "high": sum(1 for r in all_results if r.get("ps1_failure", {}).get("risk_tier") == "HIGH"),
+            "medium": sum(1 for r in all_results if r.get("ps1_failure", {}).get("risk_tier") == "MEDIUM"),
+            "low": sum(1 for r in all_results if r.get("ps1_failure", {}).get("risk_tier") == "LOW"),
+        },
+        "ps2_summary": {
+            "devices_with_errors": len(error_devices),
+            "devices_high_error": len(high_error_devices),
+            "fleet_avg_error_count": round(sum(d.error_count for d in batch.devices) / len(batch.devices), 2)
+        },
+        "ps3_summary": {
+            "devices_with_risk_factors": sum(1 for r in all_results if r["ps3_root_cause"]["total_risk_factors"] > 0),
+            "top_cause_across_fleet": _get_top_fleet_cause(all_results)
+        },
+        "ps4_summary": {
+            "anomalies": sum(1 for r in all_results if r.get("ps4_anomaly", {}).get("is_anomaly", False)),
+            "normal": sum(1 for r in all_results if not r.get("ps4_anomaly", {}).get("is_anomaly", True)),
+        },
+        "ps5_summary": {
+            "critical": sum(1 for r in all_results if r.get("ps5_sla_risk", {}).get("risk_tier") == "CRITICAL"),
+            "high": sum(1 for r in all_results if r.get("ps5_sla_risk", {}).get("risk_tier") == "HIGH"),
+            "avg_rul_days": round(np.mean([r["ps5_sla_risk"]["rul_estimate_days"]
+                                            for r in all_results
+                                            if "rul_estimate_days" in r.get("ps5_sla_risk", {})]) if all_results else 0, 1)
+        }
+    }
+
+    return {
+        "devices": all_results,
+        "summary": summary
+    }
+
+
+def _get_top_fleet_cause(results):
+    """Find the most common root cause across all devices."""
+    causes = {}
+    for r in results:
+        for factor in r.get("ps3_root_cause", {}).get("risk_factors", []):
+            name = factor["factor"]
+            causes[name] = causes.get(name, 0) + 1
+    if causes:
+        top = sorted(causes.items(), key=lambda x: -x[1])[0]
+        return {"cause": top[0], "affected_devices": top[1]}
+    return {"cause": "None", "affected_devices": 0}
+
+
 # ─── Dashboard Data Endpoints ─────────────────────────────
 
 def _read_csv_safe(path):
