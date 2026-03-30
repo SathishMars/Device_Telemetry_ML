@@ -6,11 +6,13 @@ import PS2Panel from './components/PS2Panel'
 import PS3Panel from './components/PS3Panel'
 import PS4Panel from './components/PS4Panel'
 import PS5Panel from './components/PS5Panel'
+import LivePredictions from './components/LivePredictions'
 
 const API_URL = 'http://localhost:8000'
 
 const TABS = [
   { id: 'summary', label: 'Overview' },
+  { id: 'live', label: 'Live Predictions' },
   { id: 'ps1', label: 'PS-1: Failure Prediction' },
   { id: 'ps2', label: 'PS-2: Error Patterns' },
   { id: 'ps3', label: 'PS-3: Root Cause' },
@@ -110,6 +112,7 @@ function App() {
 
       <main className="content">
         {activeTab === 'summary' && <Summary data={data} />}
+        {activeTab === 'live' && <LivePredictions />}
         {activeTab === 'ps1' && <PS1Panel data={data?.ps1_failure_prediction} detail={psData.ps1} />}
         {activeTab === 'ps2' && <PS2Panel data={data?.ps2_error_patterns} detail={psData.ps2} />}
         {activeTab === 'ps3' && <PS3Panel data={data?.ps3_root_cause} detail={psData.ps3} />}
